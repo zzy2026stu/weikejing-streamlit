@@ -63,7 +63,7 @@ SYS_PROMPT = """你是「微课镜」，基于语文课程与教学论知识库�
 4. 禁止仅输出分数，必须完整呈现（确立标准—诊断问题—原理阐释—双版本修改—对标检索）闭环。禁止编造任何视频链接或URL，只输出平台名称与关键词。
 5. 若输入非语文试讲稿，友好提示：“请粘贴您在微格实训中的真实试讲转写文本。”
 6. 模块二固定输出6条（覆盖导入、精读、提问、活动、结课）；若原文可诊断点不足6处，按实际数量输出（最少3条），原句摘录必须真实来自原文，禁止虚构凑数。
-7. 动态输出调控：首次诊断自动启用「精简模式」，全文严格控制在1500字以内。结尾附引导语：“如需获取含全部诊断条目的完整长文报告（约3000-5000字），请点击（生成完整报告）”。
+7. 动态输出调控：首次诊断自动启用「精简模式」，请尽可能详细、完整地输出所有四个模块，不受字数限制。结尾附引导语：“如需获取含全部诊断条目的完整长文报告（约3000-5000字），请点击（生成完整报告）”。
 8. 当用户回复“生成完整报告”时，基于本轮对话中已有的诊断内容，补全并输出完整长文报告（约3000-5000字，含模块二全部6条诊断），无需重新诊断。
 9. 启动引导语已由网页界面展示，无需在回答中重复输出。
 """
@@ -130,25 +130,42 @@ def build_system_prompt():
 
 # 调用DeepSeek并把对话写入历史（多轮）
 def run_chat(user_msg):
+    # 1. 记录用户消息
     st.session_state["messages"].append({"role": "user", "content": user_msg})
-    with st.spinner("微课镜正在分析课堂语言，生成诊断报告..."):
+    
+    with st.spinner("微课镜正在深度思考，开始输出..."):
         try:
+            # 2. 发起流式请求 (注意 stream=True)
             resp = client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[{"role": "system", "content": build_system_prompt()}]
-                          + st.session_state["messages"],
-                temperature=0.3
+                model="deepseek-chat", 
+                messages=[{"role": "system", "content": build_system_prompt()}] + st.session_state["messages"],
+                temperature=0.3,
+                max_tokens=4000,
+                stream=True
             )
-            ans = resp.choices[0].message.content
-            st.session_state["messages"].append({"role": "assistant", "content": ans})
-            st.session_state["clear_input"] = True
+            
+            # 3. 定义打字机的搬运工
+            def generate_chunks():
+                for chunk in resp:
+                    # 安全检查：防止空数据或者结束符报错
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        yield chunk.choices[0].delta.content
+            
+            # 4. 在网页上实时打印，并接收完整的碎片（这里返回的是一个元组）
+            ans_tuple = st.write_stream(generate_chunks())
+            
+            # 5. 把元组里的碎片拼成一个完整的字符串
+            ans_text = "".join(ans_tuple)
+            
+            # 6. 保存到历史记录中
+            st.session_state["messages"].append({"role": "assistant", "content": ans_text})
+            #st.session_state["clear_input"] = True
             st.rerun()
+            
         except Exception as e:
-            # 回滚刚加入的用户消息，方便重试
+            # 如果报错，回滚刚才的用户消息，并提示
             st.session_state["messages"].pop()
-            st.error(f"分析失败，请检查网络或稍后重试。错误信息：{e}")
-
-
+            st.error(f"分析失败：{e}")
 # 操作按钮
 col1, col2 = st.columns(2)
 with col1:
@@ -164,9 +181,24 @@ with col2:
         run_chat("生成完整报告")
 
 # 对话历史展示
-for m in st.session_state["messages"]:
+# 对话历史展示
+for i, m in enumerate(st.session_state["messages"]):
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
+        
+        # 👇 核心新增：如果这是最后一条回复，并且是 AI 发的，就显示重新生成按钮
+        if i == len(st.session_state["messages"]) - 1 and m["role"] == "assistant":
+            if st.button("🔄 重新生成", key="regenerate_btn"):
+                # 1. 取出刚才用户发的那句话
+                last_user_msg = st.session_state["messages"][-2]["content"]
+                # 2. 把最后这次不满意的问答（用户提问+AI回答）从记录里删掉
+                st.session_state["messages"] = st.session_state["messages"][:-2]
+                # 3. 重新调用 AI
+                run_chat(last_user_msg)
+# 在历史记录的最下方，添加一个固定聊天输入框
+chat_prompt = st.chat_input("对诊断报告有任何疑问，或需要修改建议，请在这里告诉我...")
 
-
-    
+# 如果用户在这个框里输入了内容并按了回车
+if chat_prompt:
+    # 直接调用咱们写好的 run_chat 函数
+    run_chat(chat_prompt)
