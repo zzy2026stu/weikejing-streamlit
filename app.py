@@ -132,36 +132,68 @@ def build_system_prompt():
 def run_chat(user_msg):
     # 1. 记录用户消息
     st.session_state["messages"].append({"role": "user", "content": user_msg})
-    
+
     with st.spinner("微课镜正在深度思考，开始输出..."):
         try:
-            # 2. 发起流式请求 (注意 stream=True)
-            resp = client.chat.completions.create(
-                model="deepseek-chat", 
-                messages=[{"role": "system", "content": build_system_prompt()}] + st.session_state["messages"],
-                temperature=0.3,
-                max_tokens=8192,
-                stream=True
-            )
-            
-            # 3. 定义打字机的搬运工
+            ans_parts = []      # 每一轮生成的片段，按轮次保存
+            truncated = False   # 续写轮次用尽仍未写完的标记
+
+            # 2. 定义打字机的搬运工（流式输出 + 长度截断时自动续写）
             def generate_chunks():
-                for chunk in resp:
-                    # 安全检查：防止空数据或者结束符报错
-                    if chunk.choices and chunk.choices[0].delta.content:
-                        yield chunk.choices[0].delta.content
-            
-            # 4. 在网页上实时打印，并接收完整的碎片（这里返回的是一个元组）
-            ans_tuple = st.write_stream(generate_chunks())
-            
-            # 5. 把元组里的碎片拼成一个完整的字符串
-            ans_text = "".join(ans_tuple)
-            
-            # 6. 保存到历史记录中
+                nonlocal truncated
+                max_rounds = 4  # 最多续写 4 轮，防止死循环
+                msgs = [{"role": "system", "content": build_system_prompt()}] + st.session_state["messages"]
+
+                for round_no in range(max_rounds):
+                    resp = client.chat.completions.create(
+                        model="deepseek-chat",
+                        messages=msgs,
+                        temperature=0.3,
+                        max_tokens=8192,  # deepseek-chat 单次输出上限
+                        stream=True
+                    )
+
+                    finish_reason = None
+                    piece = ""
+                    for chunk in resp:
+                        # 安全检查：防止空数据或者结束符报错
+                        if not chunk.choices:
+                            continue
+                        choice = chunk.choices[0]
+                        if choice.delta.content:
+                            piece += choice.delta.content
+                            yield choice.delta.content
+                        if choice.finish_reason:
+                            finish_reason = choice.finish_reason
+
+                    ans_parts.append(piece)
+
+                    # 正常结束（stop）直接退出；只有撞到长度上限才续写
+                    if finish_reason != "length":
+                        break
+                    if round_no == max_rounds - 1:
+                        truncated = True
+                        break
+
+                    msgs = msgs + [
+                        {"role": "assistant", "content": "".join(ans_parts)},
+                        {"role": "user", "content": "你刚才的输出因长度上限被截断了，请从中断处继续往下写，不要重复已输出内容，也不要重新开头。"}
+                    ]
+
+            # 3. 在网页上实时打印
+            st.write_stream(generate_chunks())
+
+            # 4. 把各轮片段拼成一个完整的字符串
+            ans_text = "".join(ans_parts)
+
+            if truncated:
+                st.warning("本次报告已达到续写上限，可能仍未写完，建议点击下方「重新生成」。")
+
+            # 5. 保存到历史记录中
             st.session_state["messages"].append({"role": "assistant", "content": ans_text})
             #st.session_state["clear_input"] = True
             st.rerun()
-            
+
         except Exception as e:
             # 如果报错，回滚刚才的用户消息，并提示
             st.session_state["messages"].pop()
@@ -202,3 +234,4 @@ chat_prompt = st.chat_input("对诊断报告有任何疑问，或需要修改建
 if chat_prompt:
     # 直接调用咱们写好的 run_chat 函数
     run_chat(chat_prompt)
+
