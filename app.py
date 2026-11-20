@@ -1,5 +1,4 @@
 import re
-import time
 from pathlib import Path
 
 import streamlit as st
@@ -7,14 +6,7 @@ from openai import OpenAI
 from pypdf import PdfReader
 
 # 从 streamlit secrets.toml 安全读取密钥
-# timeout：单次请求最长等待时间，避免页面无限卡住
-# max_retries：关掉 SDK 自带重试，由 run_chat 内的断线重试统一处理
-client = OpenAI(
-    api_key=st.secrets["DEEPSEEK_API_KEY"],
-    base_url="https://api.deepseek.com",
-    timeout=300.0,
-    max_retries=0,
-)
+client = OpenAI(api_key=st.secrets["DEEPSEEK_API_KEY"], base_url="https://api.deepseek.com")
 
 # 课程标准PDF路径
 PDF_PATH = Path(__file__).parent / "2025年修订)《义务教育语文课程标准·日常修订版)(2022年版.pdf"
@@ -71,7 +63,7 @@ SYS_PROMPT = """你是「微课镜」，基于语文课程与教学论知识库�
 4. 禁止仅输出分数，必须完整呈现（确立标准—诊断问题—原理阐释—双版本修改—对标检索）闭环。禁止编造任何视频链接或URL，只输出平台名称与关键词。
 5. 若输入非语文试讲稿，友好提示：“请粘贴您在微格实训中的真实试讲转写文本。”
 6. 模块二固定输出6条（覆盖导入、精读、提问、活动、结课）；若原文可诊断点不足6处，按实际数量输出（最少3条），原句摘录必须真实来自原文，禁止虚构凑数。
-7. 动态输出调控：首次诊断自动启用「精简模式」，请尽可能详细、完整地输出所有四个模块，不受字数限制。结尾附引导语：“如需获取含全部诊断条目的完整长文报告（约3000-5000字），请点击（生成完整报告）”。
+7. 动态输出调控：首次诊断自动启用「精简模式」，全文严格控制在1500字以内。结尾附引导语：“如需获取含全部诊断条目的完整长文报告（约3000-5000字），请点击（生成完整报告）”。
 8. 当用户回复“生成完整报告”时，基于本轮对话中已有的诊断内容，补全并输出完整长文报告（约3000-5000字，含模块二全部6条诊断），无需重新诊断。
 9. 启动引导语已由网页界面展示，无需在回答中重复输出。
 """
@@ -138,97 +130,25 @@ def build_system_prompt():
 
 # 调用DeepSeek并把对话写入历史（多轮）
 def run_chat(user_msg):
-    # 1. 记录用户消息
     st.session_state["messages"].append({"role": "user", "content": user_msg})
-
-    with st.spinner("微课镜正在深度思考，开始输出..."):
-        ans_parts = []      # 每一轮完整输出的片段，按轮次保存
-        partial = ""        # 已经实时打印到页面上的全部内容
-        truncated = False   # 续写次数用尽仍未写完的标记
-
-        # 2. 定义打字机的搬运工（流式输出 + 断线重试 + 长度截断续写）
-        def generate_chunks():
-            nonlocal partial, truncated
-            max_continues = 4   # 长度截断后的最多续写次数
-            max_retries = 3     # 网络中断后的最多重试次数
-            continues = 0
-            retries = 0
-            msgs = [{"role": "system", "content": build_system_prompt()}] + st.session_state["messages"]
-
-            while True:
-                try:
-                    resp = client.chat.completions.create(
-                        model="deepseek-chat",
-                        messages=msgs,
-                        temperature=0.3,
-                        max_tokens=8192,  # deepseek-chat 单次输出上限
-                        stream=True
-                    )
-
-                    finish_reason = None
-                    piece = ""
-                    for chunk in resp:
-                        # 安全检查：防止空数据或者结束符报错
-                        if not chunk.choices:
-                            continue
-                        choice = chunk.choices[0]
-                        if choice.delta.content:
-                            piece += choice.delta.content
-                            partial += choice.delta.content
-                            yield choice.delta.content
-                        if choice.finish_reason:
-                            finish_reason = choice.finish_reason
-
-                except Exception as e:
-                    # 连接中断 / 超时：已输出的内容保留，重试这一轮
-                    retries += 1
-                    if retries > max_retries:
-                        raise e
-                    time.sleep(min(2 * retries, 6))
-                    msgs = msgs + [
-                        {"role": "assistant", "content": partial},
-                        {"role": "user", "content": "刚才网络中断了，请从中断处继续往下写，不要重复已输出内容，也不要重新开头。"}
-                    ]
-                    continue
-
-                ans_parts.append(piece)
-                retries = 0  # 成功跑完一轮，重试计数清零
-
-                # 只有明确收到 stop 才算正常写完；被截断或没收到结束标记都继续写
-                if finish_reason == "stop":
-                    break
-                continues += 1
-                if continues > max_continues:
-                    truncated = True
-                    break
-                msgs = msgs + [
-                    {"role": "assistant", "content": partial},
-                    {"role": "user", "content": "你的输出还没写完（被长度上限截断），请从中断处继续往下写，不要重复已输出内容，也不要重新开头。"}
-                ]
-
+    with st.spinner("微课镜正在分析课堂语言，生成诊断报告..."):
         try:
-            # 3. 在网页上实时打印
-            st.write_stream(generate_chunks())
-
-            # 4. 拼成完整字符串（优先用轮次片段，兜底用页面已打印内容）
-            ans_text = "".join(ans_parts) or partial
-
-            if truncated:
-                st.warning("本次报告已达到续写上限，可能仍未写完，建议点击下方「重新生成」。")
-
-            # 5. 保存到历史记录中
-            st.session_state["messages"].append({"role": "assistant", "content": ans_text})
-            #st.session_state["clear_input"] = True
+            resp = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[{"role": "system", "content": build_system_prompt()}]
+                          + st.session_state["messages"],
+                temperature=0.3
+            )
+            ans = resp.choices[0].message.content
+            st.session_state["messages"].append({"role": "assistant", "content": ans})
+            st.session_state["clear_input"] = True
             st.rerun()
-
         except Exception as e:
-            # 6. 出错时保留已经输出的内容，不要把整段回答丢掉
-            if partial:
-                st.session_state["messages"].append({"role": "assistant", "content": partial})
-                st.error(f"网络连接中断，本次输出不完整，可点击「重新生成」重试。错误信息：{e}")
-            else:
-                st.session_state["messages"].pop()
-                st.error(f"分析失败：{e}")
+            # 回滚刚加入的用户消息，方便重试
+            st.session_state["messages"].pop()
+            st.error(f"分析失败，请检查网络或稍后重试。错误信息：{e}")
+
+
 # 操作按钮
 col1, col2 = st.columns(2)
 with col1:
@@ -244,24 +164,9 @@ with col2:
         run_chat("生成完整报告")
 
 # 对话历史展示
-# 对话历史展示
-for i, m in enumerate(st.session_state["messages"]):
+for m in st.session_state["messages"]:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
-        
-        # 👇 核心新增：如果这是最后一条回复，并且是 AI 发的，就显示重新生成按钮
-        if i == len(st.session_state["messages"]) - 1 and m["role"] == "assistant":
-            if st.button("🔄 重新生成", key="regenerate_btn"):
-                # 1. 取出刚才用户发的那句话
-                last_user_msg = st.session_state["messages"][-2]["content"]
-                # 2. 把最后这次不满意的问答（用户提问+AI回答）从记录里删掉
-                st.session_state["messages"] = st.session_state["messages"][:-2]
-                # 3. 重新调用 AI
-                run_chat(last_user_msg)
-# 在历史记录的最下方，添加一个固定聊天输入框
-chat_prompt = st.chat_input("对诊断报告有任何疑问，或需要修改建议，请在这里告诉我...")
 
-# 如果用户在这个框里输入了内容并按了回车
-if chat_prompt:
-    # 直接调用咱们写好的 run_chat 函数
-    run_chat(chat_prompt)
+
+    
