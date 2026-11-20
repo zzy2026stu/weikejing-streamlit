@@ -140,7 +140,7 @@ def run_chat(user_msg):
                 model="deepseek-chat", 
                 messages=[{"role": "system", "content": build_system_prompt()}] + st.session_state["messages"],
                 temperature=0.3,
-                max_tokens=4000,
+                max_tokens=8192,
                 stream=True
             )
             
