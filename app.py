@@ -1,4 +1,5 @@
 import re
+import time
 from pathlib import Path
 
 import streamlit as st
@@ -6,7 +7,14 @@ from openai import OpenAI
 from pypdf import PdfReader
 
 # 从 streamlit secrets.toml 安全读取密钥
-client = OpenAI(api_key=st.secrets["DEEPSEEK_API_KEY"], base_url="https://api.deepseek.com")
+# timeout：单次请求最长等待时间，避免页面无限卡住
+# max_retries：关掉 SDK 自带重试，由 run_chat 内的断线重试统一处理
+client = OpenAI(
+    api_key=st.secrets["DEEPSEEK_API_KEY"],
+    base_url="https://api.deepseek.com",
+    timeout=300.0,
+    max_retries=0,
+)
 
 # 课程标准PDF路径
 PDF_PATH = Path(__file__).parent / "2025年修订)《义务教育语文课程标准·日常修订版)(2022年版.pdf"
@@ -134,17 +142,21 @@ def run_chat(user_msg):
     st.session_state["messages"].append({"role": "user", "content": user_msg})
 
     with st.spinner("微课镜正在深度思考，开始输出..."):
-        try:
-            ans_parts = []      # 每一轮生成的片段，按轮次保存
-            truncated = False   # 续写轮次用尽仍未写完的标记
+        ans_parts = []      # 每一轮完整输出的片段，按轮次保存
+        partial = ""        # 已经实时打印到页面上的全部内容
+        truncated = False   # 续写次数用尽仍未写完的标记
 
-            # 2. 定义打字机的搬运工（流式输出 + 长度截断时自动续写）
-            def generate_chunks():
-                nonlocal truncated
-                max_rounds = 4  # 最多续写 4 轮，防止死循环
-                msgs = [{"role": "system", "content": build_system_prompt()}] + st.session_state["messages"]
+        # 2. 定义打字机的搬运工（流式输出 + 断线重试 + 长度截断续写）
+        def generate_chunks():
+            nonlocal partial, truncated
+            max_continues = 4   # 长度截断后的最多续写次数
+            max_retries = 3     # 网络中断后的最多重试次数
+            continues = 0
+            retries = 0
+            msgs = [{"role": "system", "content": build_system_prompt()}] + st.session_state["messages"]
 
-                for round_no in range(max_rounds):
+            while True:
+                try:
                     resp = client.chat.completions.create(
                         model="deepseek-chat",
                         messages=msgs,
@@ -162,29 +174,44 @@ def run_chat(user_msg):
                         choice = chunk.choices[0]
                         if choice.delta.content:
                             piece += choice.delta.content
+                            partial += choice.delta.content
                             yield choice.delta.content
                         if choice.finish_reason:
                             finish_reason = choice.finish_reason
 
-                    ans_parts.append(piece)
-
-                    # 正常结束（stop）直接退出；只有撞到长度上限才续写
-                    if finish_reason != "length":
-                        break
-                    if round_no == max_rounds - 1:
-                        truncated = True
-                        break
-
+                except Exception as e:
+                    # 连接中断 / 超时：已输出的内容保留，重试这一轮
+                    retries += 1
+                    if retries > max_retries:
+                        raise e
+                    time.sleep(min(2 * retries, 6))
                     msgs = msgs + [
-                        {"role": "assistant", "content": "".join(ans_parts)},
-                        {"role": "user", "content": "你刚才的输出因长度上限被截断了，请从中断处继续往下写，不要重复已输出内容，也不要重新开头。"}
+                        {"role": "assistant", "content": partial},
+                        {"role": "user", "content": "刚才网络中断了，请从中断处继续往下写，不要重复已输出内容，也不要重新开头。"}
                     ]
+                    continue
 
+                ans_parts.append(piece)
+                retries = 0  # 成功跑完一轮，重试计数清零
+
+                # 只有明确收到 stop 才算正常写完；被截断或没收到结束标记都继续写
+                if finish_reason == "stop":
+                    break
+                continues += 1
+                if continues > max_continues:
+                    truncated = True
+                    break
+                msgs = msgs + [
+                    {"role": "assistant", "content": partial},
+                    {"role": "user", "content": "你的输出还没写完（被长度上限截断），请从中断处继续往下写，不要重复已输出内容，也不要重新开头。"}
+                ]
+
+        try:
             # 3. 在网页上实时打印
             st.write_stream(generate_chunks())
 
-            # 4. 把各轮片段拼成一个完整的字符串
-            ans_text = "".join(ans_parts)
+            # 4. 拼成完整字符串（优先用轮次片段，兜底用页面已打印内容）
+            ans_text = "".join(ans_parts) or partial
 
             if truncated:
                 st.warning("本次报告已达到续写上限，可能仍未写完，建议点击下方「重新生成」。")
@@ -195,9 +222,13 @@ def run_chat(user_msg):
             st.rerun()
 
         except Exception as e:
-            # 如果报错，回滚刚才的用户消息，并提示
-            st.session_state["messages"].pop()
-            st.error(f"分析失败：{e}")
+            # 6. 出错时保留已经输出的内容，不要把整段回答丢掉
+            if partial:
+                st.session_state["messages"].append({"role": "assistant", "content": partial})
+                st.error(f"网络连接中断，本次输出不完整，可点击「重新生成」重试。错误信息：{e}")
+            else:
+                st.session_state["messages"].pop()
+                st.error(f"分析失败：{e}")
 # 操作按钮
 col1, col2 = st.columns(2)
 with col1:
@@ -234,4 +265,3 @@ chat_prompt = st.chat_input("对诊断报告有任何疑问，或需要修改建
 if chat_prompt:
     # 直接调用咱们写好的 run_chat 函数
     run_chat(chat_prompt)
-
